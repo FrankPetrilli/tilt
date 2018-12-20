@@ -181,27 +181,63 @@ func (ms *ManifestState) IsPendingTime(t time.Time) bool {
 
 // Whether changes have been made to this Manifest's mount files
 // or config since the last build.
-func (ms *ManifestState) PendingBuildSince() time.Time {
-	earliest := time.Now()
-	isPending := false
+//
+// Returns:
+// bool: whether changes have been made
+// Time: the time of the earliest change
+func (ms *ManifestState) HasPendingChanges() (bool, time.Time) {
+	return ms.HasPendingChangesBefore(time.Now())
+}
 
-	for _, t := range ms.PendingFileChanges {
-		if t.Before(earliest) && ms.IsPendingTime(t) {
-			earliest = t
-			isPending = true
-		}
-	}
-
+// Like HasPendingChanges, but relative to a particular time.
+func (ms *ManifestState) HasPendingChangesBefore(highWaterMark time.Time) (bool, time.Time) {
+	ok := false
+	earliest := highWaterMark
 	t := ms.PendingManifestChange
 	if t.Before(earliest) && ms.IsPendingTime(t) {
+		ok = true
 		earliest = t
-		isPending = true
 	}
 
-	if !isPending {
-		return time.Time{}
+	spurious, _ := onlySpuriousChanges(ms.PendingFileChanges)
+	if !spurious {
+		for _, t := range ms.PendingFileChanges {
+			if t.Before(earliest) && ms.IsPendingTime(t) {
+				ok = true
+				earliest = t
+			}
+		}
 	}
-	return earliest
+	if !ok {
+		return ok, time.Time{}
+	}
+	return ok, earliest
+}
+
+// Check if the filesChangedSet only contains spurious changes that
+// we don't want to rebuild on, like IDE temp/lock files.
+//
+// NOTE(nick): This isn't an ideal solution. In an ideal world, the user would
+// put everything to ignore in their gitignore/dockerignore files. This is a stop-gap
+// so they don't have a terrible experience if those files aren't there or
+// aren't in the right places.
+func onlySpuriousChanges(filesChanged map[string]time.Time) (bool, error) {
+	// If a lot of files have changed, don't treat this as spurious.
+	if len(filesChanged) > 3 {
+		return false, nil
+	}
+
+	for f := range filesChanged {
+		broken, err := ospath.IsBrokenSymlink(f)
+		if err != nil {
+			return false, err
+		}
+
+		if !broken {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 type YAMLManifestState struct {
@@ -434,6 +470,7 @@ func StateToView(s EngineState) view.View {
 		// "most interesting" pod that's crash looping, or show logs from all pods
 		// at once).
 		pod := ms.MostRecentPod()
+		_, pendingBuildSince := ms.HasPendingChanges()
 		r := view.Resource{
 			Name:               name,
 			DirectoriesWatched: relWatchDirs,
@@ -441,7 +478,7 @@ func StateToView(s EngineState) view.View {
 			LastDeployTime:     ms.LastSuccessfulDeployTime,
 			BuildHistory:       buildHistory,
 			PendingBuildEdits:  pendingBuildEdits,
-			PendingBuildSince:  ms.PendingBuildSince(),
+			PendingBuildSince:  pendingBuildSince,
 			PendingBuildReason: ms.NextBuildReason(),
 			CurrentBuild:       currentBuild,
 			PodName:            pod.PodID.String(),
